@@ -79,3 +79,7 @@ The files in `data/` are synthetic and only reproduce the input formats.
 - For the Kaggle runs, set `V9_ROOT` to the folder of the attached TIST and Yelp datasets (default `/kaggle/input`).
 - Static seeds come from NumPy's PCG64 with seed 7. In the FSQ-OS stream, a place's seed is the top 53 bits of `SplitMix64(h ⊕ s)`, where `h` is a hash of its identifier, so the place keeps its seed across releases.
 - Times exclude building the neighbor index, for every method.
+
+## License
+
+MIT. See `LICENSE`.
