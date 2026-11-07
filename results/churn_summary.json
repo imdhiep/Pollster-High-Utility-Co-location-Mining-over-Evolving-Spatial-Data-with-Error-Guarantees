@@ -1,0 +1,10 @@
+{"source":"v56 run 366352172 pollster_v22_churn.json, sums over snapshots 1..17 (k=3, TIST, IDLE 6, churn share q of dynamic instances)",
+"churn_0.01":{"remine":45.08,"exact_inc":3.68,"lb":0.28,"exact_count":7.26,"index_rebuild":2.6,"count_maxdiff":0,"affected_share_mean":0.022,"count_live_max":9195449,
+ "p300":{"inc":1.65,"rebuild":3.12,"spur":0.003,"spur_indep":0.0284,"f1":0.899},"p1000":{"inc":2.49,"rebuild":8.52,"spur":0.0019,"spur_indep":0.0144,"f1":0.95}},
+"churn_0.05":{"remine":48.32,"exact_inc":11.39,"lb":0.94,"exact_count":9.16,"affected_share_mean":0.097,"count_live_max":10129065,
+ "p300":{"inc":2.26,"rebuild":3.15,"spur":0.0042,"spur_indep":0.0285},"p1000":{"inc":4.3,"rebuild":8.32,"spur":0.0027,"spur_indep":0.0145}},
+"churn_0.2":{"remine":55.09,"exact_inc":30.18,"lb":3.23,"exact_count":16.77,"affected_share_mean":0.279,"count_live_max":13948128,
+ "p300":{"inc":3.94,"rebuild":3.16,"spur":0.0068,"spur_indep":0.0301},"p1000":{"inc":7.59,"rebuild":8.48,"spur":0.0045,"spur_indep":0.0146}},
+"churn_1":{"remine":114.82,"exact_inc":110.18,"lb":17.8,"exact_count":86.76,"index_rebuild":6.25,"count_maxdiff":0,"affected_share_mean":0.63,"count_live_max":48053539,"count_pairs_touched":400473773,
+ "p300":{"inc":8.06,"rebuild":3.69,"spur":0.0191,"spur_indep":0.0433,"f1":0.921,"state":1018633},"p1000":{"inc":15.62,"rebuild":9.83,"spur":0.0118,"spur_indep":0.0215,"f1":0.957,"state":3404546},
+ "p7400":{"inc":75.14,"rebuild":58.78,"spur":0.0037,"spur_indep":0.0042,"f1":0.988,"state":22980840},"bern_viol_all":0,"maint_vs_rebuild_maxdiff_max":2.09e-14}}

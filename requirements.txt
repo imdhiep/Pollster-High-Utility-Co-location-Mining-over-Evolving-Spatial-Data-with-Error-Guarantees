@@ -1,0 +1,6 @@
+numpy>=2.1
+numba>=0.61
+scipy
+pandas
+pyarrow            # FSQ-OS only
+huggingface_hub>=0.24  # FSQ-OS only
