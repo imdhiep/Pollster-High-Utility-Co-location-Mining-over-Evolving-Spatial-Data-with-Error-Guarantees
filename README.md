@@ -17,7 +17,7 @@ The files in `src/` are byte-identical to the scripts that produced the reported
 
 | file | sha256 |
 |---|---|
-| `src/pollster.py` | `9b5481a37e3d92d08bd59efcd0d32cc6c0537cb0f6c1bb52de95ffcfe331f829` |
+| `src/pollster.py` | `3673c5d3552c683e6e246856723a30517bd3e7f0b532b6bc2ba0ab087541a7c4` |
 | `src/fsq_os_static.py` | `000222e532279d3b5c850be03163847865b4e90f4a80c6cd81b726736368155e` |
 
 ## Requirements
@@ -64,7 +64,7 @@ The experiments are selected with `V9_PARTS`, a comma-separated list:
 
 `progref`, `prtest`, and `fsqprog` (progressive refinement) are not used in the paper.
 
-Grid index and maintenance options: `V26_GRID=1` uses a grid of cells of side d over the current snapshot instead of the k-d tree over all versions (`churn`, `fsqdelta`); `V26_GRIDUPD` (default 1) updates the grid in place between snapshots instead of rebuilding it; `V26_AUTO` (default 1) adds the automatic mode to `fsqdelta`. `V26_UMETH` and `V26_UTILS` restrict the sampling methods and utility distributions of `util`.
+Grid index and maintenance options: `V26_GRID=1` uses a grid of cells of side d over the current snapshot instead of the k-d tree over all versions (`churn`, `fsqdelta`); `V26_GRIDUPD` (default 1) updates the grid in place between snapshots instead of rebuilding it; `V26_AUTO` (default 1) adds the automatic mode to `fsqdelta` and `V26_SAUTO` (default 1) to the TIST streams; the automatic mode calibrates its cost model on the measured times of earlier updates. `V26_MOVE` (default 1) evaluates the bound on the change of every UPI between snapshots for the sample sizes in `V26_MOVE_MS` (default `300,1000`). `V26_UMETH` and `V26_UTILS` restrict the sampling methods and utility distributions of `util`.
 
 Other parameters: `V9_K` (number of features, default 60), `V9_D` (distance in meters, default 150), `V9_MS` (sample sizes), and `V9_IDLE` (months without a check-in before an instance is deleted, default 6).
 

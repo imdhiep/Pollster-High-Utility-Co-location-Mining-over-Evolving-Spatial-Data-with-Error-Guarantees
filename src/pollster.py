@@ -731,6 +731,34 @@ def grid_query(nd, PP, FF, gk, gid, dd, d2, NB, OFF, allowed_f, use_allowed, sam
                             c += 1
         cnt[i] = c
 
+@numba.njit(parallel=True)
+def near_any(pr, PP, ck, cid, dd, d2, NB, OFF, out):
+    """out[i] = True iff some changed instance (cid, sorted by cell key ck) lies within dd of pr[i]."""
+    for i in prange(len(pr)):
+        o = pr[i]; hit = False
+        cx = np.int64(np.floor(PP[o, 0] / dd)) + OFF; cy = np.int64(np.floor(PP[o, 1] / dd)) + OFF; cz = np.int64(np.floor(PP[o, 2] / dd)) + OFF
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                for dz in range(-1, 2):
+                    if hit:
+                        continue
+                    key = ((cx + dx) * NB + (cy + dy)) * NB + (cz + dz)
+                    lo = np.searchsorted(ck, key); hi = np.searchsorted(ck, key, side='right')
+                    for j in range(lo, hi):
+                        v = cid[j]
+                        ex = PP[v, 0] - PP[o, 0]; ey = PP[v, 1] - PP[o, 1]; ez = PP[v, 2] - PP[o, 2]
+                        if ex * ex + ey * ey + ez * ez <= d2:
+                            hit = True
+                            break
+        out[i] = hit
+
+def probe_share(pr, chg_pts):
+    """share of the probe instances within d of a change; one sort of the changes by cell, no tree."""
+    t0 = time.time(); ck = grid_keys(chg_pts); o = np.argsort(ck, kind='stable'); out = np.zeros(len(pr), np.bool_)
+    t1 = time.time(); near_any(np.ascontiguousarray(pr, np.int64), P, ck[o], chg_pts[o], D, D * D, G_NB, G_OFF, out)
+    probe_share.t_sort = t1 - t0; probe_share.t_query = time.time() - t1     # timings, read by the cost model
+    return float(out.mean()) if len(pr) else 0.0
+
 def grid_neigh(nd, g, allowed=None, samef=False):
     gk, gid = g; nd = np.ascontiguousarray(nd, np.int64)
     al = np.ones(1, np.bool_) if allowed is None else np.asarray(allowed, np.bool_)
@@ -967,6 +995,78 @@ def eps2(x, lam, m, k=3, Kf=60, delta=0.1, T=1):
     variance <= lam x / m, so |est - UPI| <= sqrt(2 lam x L2 / m) + 2 lam L2 / (3 m)."""
     L2 = bern_L2(k, Kf, delta, T); lam = np.asarray(lam, np.float64)
     return np.sqrt(2.0 * lam * np.asarray(x, dtype=np.float64) * L2 / m) + 2.0 * lam * L2 / (3.0 * m)
+# ---------------------------------------------------------------- v26d: bound on the change of a UPI between snapshots
+# With persistent seeds, UPI_t(c) - UPI_{t-1}(c) is estimated by a sum over instances of D_o = y_o^t - y_o^{t-1},
+# y_o^s = 1[o sampled at s] 1[c in P_s(o)] w_o^s / U_c^s. The D_o are independent (one seed each), |D_o - E D_o| <= b,
+# and Var(sum) <= V = E sum Dl_o^2, where Dl_o drops the deterministic terms of heavy instances (u >= tau, always sampled),
+# so |Dl_o| <= b' = max lambda / m. V is bounded from the sample: sum D_o^2 has nonnegative terms <= b'^2, so
+# V <= (b' sqrt(L1/2) + sqrt(b'^2 L1/2 + Vhat))^2 (one-sided, Maurer). Then |dhat - d| <= sqrt(2 V L2) + 2 b L2 / 3.
+# Union bound over the P patterns and the T-1 updates: L1 = ln(2 P (T-1)/delta), L2 = ln(4 P (T-1)/delta).
+@numba.njit
+def sort_rows_local(ptr, r):
+    for o in range(len(ptr) - 1):
+        a = ptr[o]; b = ptr[o + 1]
+        if b - a > 1:
+            r[a:b] = np.sort(r[a:b])
+
+@numba.njit
+def cross_acc(ia, ib, wa, wb, pa, ra, pb, rb, X):
+    """X[r] += wa[j] * wb[j] for every pattern r in both P_a(ia[j]) and P_b(ib[j]) (rows sorted)."""
+    for j in range(len(ia)):
+        i = ia[j]; k = ib[j]; x = pa[i]; xe = pa[i + 1]; y = pb[k]; ye = pb[k + 1]; w = wa[j] * wb[j]
+        while x < xe and y < ye:
+            if ra[x] == rb[y]:
+                X[ra[x]] += w; x += 1; y += 1
+            elif ra[x] < rb[y]:
+                x += 1
+            else:
+                y += 1
+
+def sample_emit(act, u, m, kmax):
+    """threshold sample (persistent seeds) with the participation set of every sampled instance."""
+    ua = np.where(act, u, 0.0); Uf = np.bincount(F, weights=ua, minlength=K); tau = np.where(Uf > 0, Uf / m, 0.0)
+    sel = np.nonzero(act & (ua > tau[F] * R))[0]; w = np.maximum(ua[sel], tau[F[sel]])
+    _, _, _, cnt, (lptr, lr) = run_enum(sel, np.zeros(len(sel)), kmax, active=act, emit=True)
+    sort_rows_local(lptr, lr)
+    wl = np.where(ua[sel] < tau[F[sel]], w, 0.0)     # light instances only: a heavy one (u >= tau) is always sampled
+    return dict(sel=sel, w=w, wl=wl, lptr=lptr, lr=lr, U=Uf, est=local_sum(w, lptr, lr), sq=local_sum(wl * wl, lptr, lr))
+
+def change_bound(a, b, m, kmax, nupd, delta=0.1):
+    """estimated change of every UPI from snapshot a to b and its bound (both from sample_emit)."""
+    Ua = dens(a['U']); Ub = dens(b['U']); ok = (Ua > 0) & (Ub > 0)
+    Ua_ = np.where(ok, Ua, 1.0); Ub_ = np.where(ok, Ub, 1.0)
+    common, ia, ib = np.intersect1d(a['sel'], b['sel'], assume_unique=True, return_indices=True)
+    X = np.zeros(NR); cross_acc(ia.astype(np.int64), ib.astype(np.int64), a['wl'][ia], b['wl'][ib], a['lptr'], a['lr'], b['lptr'], b['lr'], X)
+    vhat = np.maximum(a['sq'] / Ua_ ** 2 + b['sq'] / Ub_ ** 2 - 2.0 * X / (Ua_ * Ub_), 0.0)
+    la = lam_max(a['U']); lb = lam_max(b['U']); bb = (la + lb) / m; b1 = np.maximum(la, lb) / m
+    P_ = sum(math.comb(K, j) for j in range(2, kmax + 1)); L1 = math.log(2.0 * P_ * nupd / delta); L2 = math.log(4.0 * P_ * nupd / delta)
+    V = (b1 * math.sqrt(L1 / 2) + np.sqrt(b1 ** 2 * L1 / 2 + vhat)) ** 2
+    e = np.sqrt(2.0 * V * L2) + 2.0 * bb * L2 / 3.0
+    dhat = b['est'] / Ub_ - a['est'] / Ua_
+    return dhat, e, ok, vhat
+
+def move_eval(a, b, ex_a, ex_b, m, kmax, nupd, delta=0.1, Ua=None, Ub=None):
+    """compare certified moves (|dhat| > e) with the true changes of the UPI (exact values ex_a, ex_b)."""
+    dhat, e, ok, vhat = change_bound(a, b, m, kmax, nupd, delta)
+    sel = np.nonzero((RSIZE <= kmax) & ok & ((ex_a > 0) | (ex_b > 0)))[0]
+    da = dens(a['U'] if Ua is None else Ua)[sel]; db = dens(b['U'] if Ub is None else Ub)[sel]
+    up_a = ex_a[sel] / da; up_b = ex_b[sel] / db; d = up_b - up_a; dh = dhat[sel]; ee = e[sel]; err = np.abs(dh - d)
+    cert = np.abs(dh) > ee; right = cert & (np.sign(dh) == np.sign(d)) & (d != 0)
+    lam = np.maximum(lam_max(a['U'])[sel], lam_max(b['U'])[sel])
+    naive = eps2(up_a, lam, m, kmax, K, delta, nupd + 1) + eps2(up_b, lam, m, kmax, K, delta, nupd + 1)
+    out = dict(n=int(len(sel)), viol=int((err > ee).sum()), ratio_max=float((err / np.maximum(ee, 1e-300)).max()) if len(sel) else 0.0,
+               e_q=[float(x) for x in np.quantile(ee, [0.1, 0.5, 0.9])] if len(sel) else [], naive_q=[float(x) for x in np.quantile(naive, [0.1, 0.5, 0.9])] if len(sel) else [],
+               err_max=float(err.max()) if len(sel) else 0.0, n_cert=int(cert.sum()), n_cert_right=int(right.sum()),
+               n_cert_naive=int((np.abs(dh) > naive).sum()), n_cert_naive_right=int(((np.abs(dh) > naive) & (np.sign(dh) == np.sign(d)) & (d != 0)).sum()),
+               sum_abs_d=float(np.abs(d).sum()), sum_abs_d_cert=float(np.abs(d[right]).sum()))
+    for g in (0.005, 0.01, 0.02, 0.05):
+        big = np.abs(d) >= g
+        out[f'g{g}'] = [int(big.sum()), int((big & right).sum()), int((big & (np.abs(dh) > naive)).sum())]
+    return out
+
+MOVE_ON = os.environ.get('V26_MOVE', '1') == '1'
+MOVE_MS = [int(x) for x in os.environ.get('V26_MOVE_MS', '300,1000').split(',') if x]
+
 def eps_hoef(m, k=3, Kf=60, delta=0.1, T=1):
     return float(math.sqrt(bern_L(k, Kf, delta, T) / (2.0 * m)))
 def eps_vc(m, k=3, Kf=60, delta=0.1, c=0.5):
@@ -1106,10 +1206,13 @@ class PMaint:
         self.m = m; self.kmax = kmax; self.rf = rebuild_frac; self.sf = resort_frac
         self.act = act.copy(); self.u = np.where(act, u, 0.0).astype(np.float64)
         self.stale = False; self.est_rb = None; self.rng = np.random.default_rng(5)
-        tb = time.time(); self.full(); ns = max(int(self.ins.sum()), 1)
+        tb = time.time(); self.full(); ns = max(int(self.ins.sum()), 1); self.t_full = time.time() - tb
         self.ce = self.t_star_full / ns; self.cr = 0.6 * self.ce; self.cq = 0.05 * self.ce
+        # v26d: calibration factors, measured time / modelled time, for each mode (EMA over the updates of that mode)
+        self.kd = max(1.0, (self.t_full - getattr(self, 't_idx', 0.0)) / max(self.t_star_full, 1e-9)); self.kr = 1.0; self.kn = 1.0
         if auto:     # measure the per-star cost of a rebuild once (not counted as maintenance)
             _, irb = pollster_rebuild(self.act, self.u, m, kmax); self.cr = irb['star_time'] / max(irb['sampled'], 1)
+            self.kr = max(1.0, irb['total_time'] / max(irb['star_time'], 1e-9))
 
     # ---------------------------------------------------------------- from scratch (initial build and fallback)
     def full(self):
@@ -1144,35 +1247,61 @@ class PMaint:
         enumeration of all stars (full()); it is taken when delta is predicted to be cheaper by the factor `back`."""
         t0 = time.time()
         chg_pts = np.concatenate([ins, dele]).astype(np.int64)
-        held = self.held_ids()
-        if len(chg_pts) and len(held):
-            pr = held if len(held) <= probe else self.rng.choice(held, probe, replace=False)
-            tr = cKDTree(P[chg_pts]); h = float(np.mean(tr.query_ball_point(P[pr], D, workers=QW[0], return_length=True) > 0))
+        # in rebuild mode, extrapolate h from the last probe, h = 1 - (1 - h_last)^(changes / changes_last), and probe
+        # only when the extrapolation does not favour rebuilding clearly (by a factor 2)
+        skip = False
+        if self.stale and getattr(self, 'h_last', None) is not None and self.nchg_last > 0 and len(chg_pts) > 0:
+            h_ex = 1.0 - (1.0 - min(self.h_last, 0.999)) ** (len(chg_pts) / self.nchg_last)
+            n_ = max(getattr(self, 'nsel_rb', 1), 1)
+            md_ = (self.cq + self.ce * h_ex) * n_
+            skip = self.kd * md_ + self._t_ne(len(chg_pts), n_) + self.t_full / 3.0 > 2.0 * back * self.kr * self.cr * n_
+        if skip:
+            h = h_ex
         else:
-            h = 0.0
+            held = self.held_ids(); n_ = max(len(held), 1)
+            if len(chg_pts) and len(held):
+                pr = held if len(held) <= probe else self.rng.choice(held, probe, replace=False)
+                h = probe_share(pr, chg_pts)
+                # locating the changed stars: one pass over the changes plus one test per held instance (measured on the probe)
+                self.ts_per = probe_share.t_sort / len(chg_pts); self.tq_per = probe_share.t_query / len(pr)
+            else:
+                h = 0.0
+            self.h_last = h; self.nchg_last = len(chg_pts)
         t_probe = time.time() - t0
-        n_ = max(len(held), 1)
-        pred_d = (self.cq + self.ce * h) * n_; pred_r = self.cr * n_
-        # leaving rebuild mode costs one stored enumeration plus the key index, amortized over 3 updates
-        go_delta = (pred_d + (self.ce * n_ + getattr(self, 't_idx', 0.0)) / 3.0 < back * pred_r) if self.stale else (pred_d < pred_r)
+        md = (self.cq + self.ce * h) * n_; mr = self.cr * n_
+        t_ne = self._t_ne(len(chg_pts), n_)
+        pred_d = self.kd * md + t_ne; pred_r = self.kr * mr
+        # leaving rebuild mode costs one full stored build (measured), amortized over 3 updates
+        go_delta = (pred_d + self.t_full / 3.0 < back * pred_r) if self.stale else (pred_d < pred_r)
         if go_delta and self.stale:
             tb = time.time(); self.act = act.copy(); self.u = np.where(act, u, 0.0).astype(np.float64); self.stale = False; self.full()
-            ns = max(int(self.ins.sum()), 1); self.ce = 0.5 * self.ce + 0.5 * self.t_star_full / ns
+            ns = max(int(self.ins.sum()), 1); self.ce = 0.5 * self.ce + 0.5 * self.t_star_full / ns; self.t_full = time.time() - tb
             info = dict(mode='full', star_time=time.time() - tb)
         elif go_delta:
-            info = self.step(ins, dele, chg, act, u)
+            tb = time.time(); info = self.step(ins, dele, chg, act, u); t_act = time.time() - tb
             if info.get('mode') == 'delta':
                 if info['recomputed'] > 50:
                     self.ce = 0.5 * self.ce + 0.5 * info['star_time'] / info['recomputed']
                 self.cq = 0.5 * self.cq + 0.5 * info['near_time'] / n_
+                t_nr = info.get('near_time', 0.0)
+                if t_ne > 0:
+                    self.kn = 0.5 * self.kn + 0.5 * self.kn * t_nr / t_ne
+                self.kd = max(0.5, 0.5 * self.kd + 0.5 * (t_act - t_nr) / max(md, 1e-9))
         else:
-            est, irb = pollster_rebuild(act, u, self.m, self.kmax)
+            tb = time.time(); est, irb = pollster_rebuild(act, u, self.m, self.kmax); t_act = time.time() - tb
             self.cr = 0.5 * self.cr + 0.5 * irb['star_time'] / max(irb['sampled'], 1)
-            self.stale = True; self.est_rb = est; self.act = act.copy(); self.u = np.where(act, u, 0.0).astype(np.float64)
+            self.kr = 0.5 * self.kr + 0.5 * t_act / max(self.cr * n_, 1e-9)
+            self.stale = True; self.est_rb = est; self.act = act; self.u = u     # references only: copied when leaving rebuild mode
             self.nsel_rb = irb['sampled']; info = dict(mode='rebuild', star_time=irb['star_time'])
-        info.update(probe_h=h, probe_time=t_probe, pred_delta=pred_d, pred_rebuild=pred_r, total_time=time.time() - t0,
+        info.update(probe_skip=bool(skip), probe_h=h, probe_time=t_probe, pred_delta=pred_d, pred_rebuild=pred_r, total_time=time.time() - t0,
                     c_e=self.ce, c_r=self.cr, c_q=self.cq)
         return info
+
+    def _t_ne(self, nchg, n_):
+        """predicted time to locate the changed stars, calibrated (kn) on the measured near_time of incremental updates."""
+        if nchg == 0:
+            return 0.0
+        return getattr(self, 'kn', 1.0) * (getattr(self, 'ts_per', 0.0) * nchg + getattr(self, 'tq_per', 0.0) * n_)
 
     def held_ids(self):
         if self.stale:
@@ -1180,7 +1309,7 @@ class PMaint:
         return np.fromiter(self.Pst.keys(), np.int64, count=len(self.Pst))
 
     def _rb_sel(self):
-        ua = self.u; Uf = np.bincount(F, weights=ua, minlength=K); tau = np.where(Uf > 0, Uf / self.m, 0.0)
+        ua = np.where(self.act, self.u, 0.0); Uf = np.bincount(F, weights=ua, minlength=K); tau = np.where(Uf > 0, Uf / self.m, 0.0)
         return np.nonzero(self.act & (ua > tau[F] * R))[0]
 
     def state_entries(self):
@@ -1677,13 +1806,16 @@ def eucoloc_insert(ins, act, u, prev_u, prev_act, gptr, gr, ex, kmax):
     gptr, gr = eu_merge(gptr, gr, pv, pr, np.bincount(pv, minlength=N).astype(np.int64))
     return gptr, gr, time.time() - t0, int(len(pv))
 
+STREAM_AUTO = os.environ.get('V26_SAUTO', '1') == '1'
+
 def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_every=1, win=0):
     S['v19'].setdefault(LABEL, [])
     try:
         cum = np.cumsum(CM_, axis=1); first = np.where(CM_.sum(1) > 0, np.argmax(CM_ > 0, axis=1), NMON_)
         lastseen = np.full(N, -10**6); prev_act = None; prev_u = None
         gptr = np.zeros(N + 1, np.int64); gr = np.zeros(0, np.int32); ex_inc = np.zeros(NR)
-        eu = None; pol = {m: None for m in DYN_M}; prev_status = {}; mu = None; ages = {m: {} for m in DYN_M}
+        eu = None; pol = {m: None for m in DYN_M}; pola = {m: None for m in DYN_M}; prev_status = {}; mu = None; ages = {m: {} for m in DYN_M}
+        mv_prev = {}; ref_prev = None
         for t in range(NMON_):
             lastseen = np.where(CM_[:, t] > 0, t, lastseen)
             act = (first <= t) if insert_only else ((first <= t) & (t - lastseen < IDLE_))
@@ -1746,8 +1878,15 @@ def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_ev
             row['pollster'] = {}
             chg_d = np.nonzero(act & prev_act & (u != prev_u))[0] if prev_act is not None else None   # delta input (not timed)
             for m in DYN_M:
-                for mode in ('coord', 'indep'):
-                    if mode == 'coord':
+                for mode in (('coord', 'auto', 'indep') if STREAM_AUTO else ('coord', 'indep')):
+                    if mode == 'auto':
+                        if pola[m] is None:
+                            tb = time.time(); pola[m] = PMaint(act, u, m, kmax, auto=True); info = dict(mode='init', total_time=time.time() - tb)
+                        else:
+                            info = pola[m].auto_step(ins, dele, chg_d, act, u)
+                            est_rb, _ = pollster_rebuild(act, u, m, kmax); info['maint_vs_rebuild_maxdiff'] = maxdiff(est_rb, pola[m].estimate())
+                        est = pola[m].estimate()
+                    elif mode == 'coord':
                         if pol[m] is None:
                             tb = time.time(); pol[m] = PMaint(act, u, m, kmax); info = dict(mode='init', total_time=time.time() - tb)
                         else:
@@ -1760,6 +1899,8 @@ def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_ev
                     info.update(mae=c_['mae'], max=c_['max'], f1=c_['thr']['90']['f1'], bern_viol=c_['bern_viol'],
                                 bern_ratio_max=c_['bern_ratio_max'], hhat_recall=c_['thr']['90']['Hhat_recall'],
                                 hhat_precision=c_['thr']['90']['Hhat_precision'], mu=c_['thr']['90']['mu'], eps_mu=c_['thr']['90'].get('eps_mu'))
+                    info.update(bern2_viol=c_['bern2_viol'], bern2_ratio_max=c_['bern2_ratio_max'],
+                                **{k_: c_['thr']['90'][k_] for k_ in ('Hhat2', 'Hhat2_precision', 'Hhat2_recall', 'H', 'Hplus2', 'Hplus2_precision', 'Hplus2_recall')})
                     if mode == 'coord' and prev_act is not None:
                         est_rb, irb = pollster_rebuild(act, u, m, kmax)
                         info['rebuild_time'] = irb['total_time']; info['maint_vs_rebuild_maxdiff'] = maxdiff(est_rb, est)
@@ -1784,6 +1925,15 @@ def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_ev
                                                          n_reported=int((okm & (Es != pEv)).sum()), n_both=int((okm & ~same & (Es != pEv)).sum()))
                     prev_status[key] = (sel, Hs, Es); info['mis_rate'] = float((Es != Hs).mean())
                     row['pollster'][key] = info
+            if MOVE_ON:
+                for m_ in MOVE_MS:
+                    tb_ = time.time(); cur_ = sample_emit(act, u, m_, kmax); t_s = time.time() - tb_
+                    if m_ in mv_prev:
+                        tb_ = time.time(); mv_ = move_eval(mv_prev[m_], cur_, ref_prev, ref, m_, kmax, NMON_ - 1)
+                        mv_.update(emit_time=t_s, eval_time=time.time() - tb_); row.setdefault('moves', {})[str(m_)] = mv_
+                        log(LABEL + ' moves m=%d' % m_, json.dumps(mv_))
+                    mv_prev[m_] = cur_
+                ref_prev = ref.copy()
             S['v19'][LABEL].append(row); save()
             log(LABEL + ' t=%d' % t, json.dumps({k_: row[k_] for k_ in row if k_ != 'pollster'}),
                 json.dumps({k_: dict(t=v['total_time'], rec=v.get('recomputed'), st=v.get('state_entries'), rb=v.get('rebuild_time'), md=v.get('maint_vs_rebuild_maxdiff'), mae=v['mae'], mx=v['max'],
@@ -1799,6 +1949,7 @@ def eu_warm():
     isn = np.zeros(1, np.bool_); eu_check(z, np.zeros(1, np.int32), np.zeros(N + 1, np.int64), np.zeros(0, np.int32), isn)
     eu_merge(np.zeros(N + 1, np.int64), np.zeros(0, np.int32), np.zeros(0, np.int64), np.zeros(0, np.int32), np.zeros(N, np.int64))
     sort_rows(np.zeros(N + 1, np.int64), np.zeros(0, np.int32))
+    probe_share(np.zeros(1, np.int64), np.zeros(1, np.int64))      # compile the probe kernel outside the timings
 eu_warm()
 
 if 'mixed' in PARTS:
@@ -2088,6 +2239,7 @@ def run_stream_v22(CM_, NMON_, IDLE_, LABEL, churn_q=1.0, ms=(300, 1000), kmax=3
         lastseen = np.full(N, -10**6); prev_act = None; prev_u = None
         gptr = np.zeros(N + 1, np.int64); gr = np.zeros(0, np.int32); ex_inc = np.zeros(NR)
         pol = {m: None for m in ms}; prev_status = {}; mu = None; ec = ExactCount(bits=27) if exact_count else None; est_rb_m = {}
+        mv_prev = {}; ref_prev = None
         for t in range(NMON_):
             lastseen = np.where(CM_[:, t] > 0, t, lastseen)
             act_r = (first <= t) & (t - lastseen < IDLE_)
@@ -2217,6 +2369,15 @@ def run_stream_v22(CM_, NMON_, IDLE_, LABEL, churn_q=1.0, ms=(300, 1000), kmax=3
                             hlt[str(hf)] = Hs.copy()
                     prev_status[key] = (sel, Hs, Es, hst, hlt)
                     row['pollster'][key] = info
+            if MOVE_ON:
+                for m_ in MOVE_MS:
+                    tb_ = time.time(); cur_ = sample_emit(act, u, m_, kmax); t_s = time.time() - tb_
+                    if m_ in mv_prev:
+                        tb_ = time.time(); mv_ = move_eval(mv_prev[m_], cur_, ref_prev, ref, m_, kmax, NMON_ - 1)
+                        mv_.update(emit_time=t_s, eval_time=time.time() - tb_); row.setdefault('moves', {})[str(m_)] = mv_
+                        log(LABEL + ' moves m=%d' % m_, json.dumps(mv_))
+                    mv_prev[m_] = cur_
+                ref_prev = ref.copy()
             out.append(row); save()
             log(LABEL + ' t=%d' % t, json.dumps({k_: row[k_] for k_ in row if k_ != 'pollster'}),
                 json.dumps({k_: dict(t=v['total_time'], rb=v.get('rebuild_time'), md=v.get('maint_vs_rebuild_maxdiff'), mae=v['mae'],
@@ -2572,7 +2733,7 @@ if 'fsqdelta' in PARTS:
         uU = np.exp(np.sqrt(2.0) * erfinv(2 * U01 - 1))               # same persistent utilities as the static FSQ run
         R = ((splitmix64(Hu ^ np.uint64(0x5DEECE66D)) >> np.uint64(11)).astype(np.float64) + 0.5) / 9007199254740992.0  # persistent seeds
         NAMES = lab; del Pu, Fu, U01
-        FD['steps'] = []; PMS = {}
+        FD['steps'] = []; PMS = {}; mv_prev = {}; ref_prev = None
         for t_ in range(NREL):
             act = ACT[t_]; row = dict(release=FD['releases'][t_], active=int(act.sum()))
             nodes = np.nonzero(act)[0]; U = np.bincount(F[act], weights=uU[act], minlength=K)
@@ -2618,6 +2779,15 @@ if 'fsqdelta' in PARTS:
                     if t_ == NREL - 1:
                         np.save(os.path.join(OUT, f'fsqd_est_{key}.npy'), est)
                     row[key] = info; log('fsqdelta', t_, key, json.dumps({k_: v for k_, v in info.items() if k_ != 'acc'}), json.dumps(info.get('acc')))
+            if MOVE_ON:
+                for m_ in MOVE_MS:
+                    tb_ = time.time(); cur_ = sample_emit(act, uU, m_, 3); t_s = time.time() - tb_
+                    if m_ in mv_prev:
+                        tb_ = time.time(); mv_ = move_eval(mv_prev[m_], cur_, ref_prev, ex3, m_, 3, NREL - 1)
+                        mv_.update(emit_time=t_s, eval_time=time.time() - tb_); row.setdefault('moves', {})[str(m_)] = mv_
+                        log('fsqdelta moves m=%d' % m_, json.dumps(mv_))
+                    mv_prev[m_] = cur_
+                ref_prev = ex3.copy()
             if t_ == NREL - 1:
                 np.save(os.path.join(OUT, 'fsqd_ex3_last.npy'), ex3); np.save(os.path.join(OUT, 'fsqd_U_last.npy'), U)
                 np.save(os.path.join(OUT, 'fsqd_rmask.npy'), RMASK)
