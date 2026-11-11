@@ -2,13 +2,13 @@
 
 Code and small test data for the paper *Pollster: High-Utility Co-location Mining over Evolving Spatial Data with Error Guarantees* (submitted to IEEE ICDE 2027).
 
-Pollster estimates the utility participation index (UPI) of every co-location pattern from one utility-proportional threshold sample per feature. With probability at least 1 − δ, every estimate is within an error bound that grows with the square root of the UPI. A pattern-level bound that uses the independence of the per-feature samples is tighter for balanced patterns and yields a certified output that contains only high-utility patterns. Every instance has a persistent random seed. The sample at a snapshot therefore depends only on that snapshot, rebuilding the sample or updating it incrementally gives the same output, and a cost model picks the cheaper of the two at every update.
+Pollster estimates the utility participation index (UPI) of every co-location pattern from one utility-proportional threshold sample per feature. With probability at least 1 − δ, every estimate is within an error bound that grows with the square root of the UPI. Every instance has a persistent random seed. The sample at a snapshot therefore depends only on that snapshot, and rebuilding the sample or updating it incrementally gives the same output.
 
 ## Repository layout
 
 | path | content |
 |---|---|
-| `src/pollster.py` | All experiments on TIST, Yelp, TIST-×r, and the FSQ-OS stream: exact miners (Star, Join, CQ), exact maintainers (Exact-Remine, Exact-Inc, Exact-Inc-LB, Exact-Count, EUCOLOC-U), and Pollster (rebuild, incremental, and automatic modes; plug-in, pattern-level, and certified outputs). |
+| `src/pollster.py` | All experiments on TIST, Yelp, TIST-×r, and the FSQ-OS stream: exact miners (Star, Join, CQ), exact maintainers (Exact-Remine, Exact-Inc, Exact-Inc-LB, Exact-Count, EUCOLOC-U), and Pollster (rebuild and incremental modes). |
 | `src/fsq_os_static.py` | Static FSQ-OS experiment (43.2 million places): exact mining over a permutation in chunks, and Pollster with threshold sampling. |
 | `data/mini/`, `data/mini_dense/` | Small synthetic inputs in the TIST and Yelp file formats (20,000 POIs). `mini` is sparse; `mini_dense` places the POIs in an 8.4 km box (mean degree about 18). |
 | `results/` | Summary of the churn experiment. |
@@ -17,7 +17,7 @@ The files in `src/` are byte-identical to the scripts that produced the reported
 
 | file | sha256 |
 |---|---|
-| `src/pollster.py` | `3673c5d3552c683e6e246856723a30517bd3e7f0b532b6bc2ba0ab087541a7c4` |
+| `src/pollster.py` | `b01272eac9dc8df91c6af123f9ecbff37049dd975901764b68f9b678d0b4f3e5` |
 | `src/fsq_os_static.py` | `000222e532279d3b5c850be03163847865b4e90f4a80c6cd81b726736368155e` |
 
 ## Requirements
@@ -64,8 +64,6 @@ The experiments are selected with `V9_PARTS`, a comma-separated list:
 
 `progref`, `prtest`, and `fsqprog` (progressive refinement) are not used in the paper.
 
-Grid index and maintenance options: `V26_GRID=1` uses a grid of cells of side d over the current snapshot instead of the k-d tree over all versions (`churn`, `fsqdelta`); `V26_GRIDUPD` (default 1) updates the grid in place between snapshots instead of rebuilding it; `V26_AUTO` (default 1) adds the automatic mode to `fsqdelta` and `V26_SAUTO` (default 1) to the TIST streams; the automatic mode calibrates its cost model on the measured times of earlier updates. `V26_MOVE` (default 1) evaluates the bound on the change of every UPI between snapshots for the sample sizes in `V26_MOVE_MS` (default `300,1000`). `V26_UMETH` and `V26_UTILS` restrict the sampling methods and utility distributions of `util`.
-
 Other parameters: `V9_K` (number of features, default 60), `V9_D` (distance in meters, default 150), `V9_MS` (sample sizes), and `V9_IDLE` (months without a check-in before an instance is deleted, default 6).
 
 ## Data
@@ -80,8 +78,4 @@ The files in `data/` are synthetic and only reproduce the input formats.
 
 - For the Kaggle runs, set `V9_ROOT` to the folder of the attached TIST and Yelp datasets (default `/kaggle/input`).
 - Static seeds come from NumPy's PCG64 with seed 7. In the FSQ-OS stream, a place's seed is the top 53 bits of `SplitMix64(h ⊕ s)`, where `h` is a hash of its identifier, so the place keeps its seed across releases.
-- With the k-d tree, times exclude building the neighbor index, for every method. With `V26_GRID=1`, the grid build or update is timed at every snapshot and reported separately (`grid_time`).
-
-## License
-
-MIT. See `LICENSE`.
+- Times exclude building the neighbor index, for every method.

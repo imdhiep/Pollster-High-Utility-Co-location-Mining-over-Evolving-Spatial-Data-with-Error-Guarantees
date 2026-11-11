@@ -642,136 +642,7 @@ ACC0 = [None]; STAMP = [0]; EMIT_CAP = [int(float(os.environ.get('V20_EMITCAP', 
 def nthreads():
     return numba.get_num_threads()
 
-# ---------------------------------------------------------------- v26: grid index over the current snapshot only
-# Cells of side d; a cell key packs the three integer cell coordinates (|coordinate| <= 6.4e6 m, so 2^18 cells per axis
-# suffice for d >= 50 m). The grid holds the active instances of one snapshot and is rebuilt from them, so no future
-# location is used; its build time is reported with every stream.
-GRID_ON = os.environ.get('V26_GRID', '0') == '1'
-GRIDS = []                       # [(active array, keys, ids)]
-G_NB = np.int64(1 << 18); G_OFF = np.int64(1 << 17)
-
-def grid_build(active):
-    ids = np.nonzero(active)[0].astype(np.int64)
-    c = np.floor(P[ids] / D).astype(np.int64) + G_OFF
-    key = (c[:, 0] * G_NB + c[:, 1]) * G_NB + c[:, 2]
-    o = np.argsort(key, kind='stable')
-    return key[o], ids[o]
-
-@numba.njit
-def grid_mark_deleted(gk, gid, dkeys, dids, keep):
-    for i in range(len(dids)):
-        lo = np.searchsorted(gk, dkeys[i]); hi = np.searchsorted(gk, dkeys[i], side='right')
-        for j in range(lo, hi):
-            if gid[j] == dids[i]:
-                keep[j] = False
-                break
-
-def grid_keys(ids):
-    c = np.floor(P[ids] / D).astype(np.int64) + G_OFF
-    return (c[:, 0] * G_NB + c[:, 1]) * G_NB + c[:, 2]
-
-def grid_update(g, prev_act, act):
-    """in-place style update of a grid: drop the deleted instances and merge in the inserted ones (O(n) copying,
-    O(changes log n) search); returns new arrays, the old grid stays valid for the previous snapshot."""
-    gk, gid = g
-    dele = np.nonzero(prev_act & ~act)[0].astype(np.int64); ins = np.nonzero(act & ~prev_act)[0].astype(np.int64)
-    keep = np.ones(len(gk), np.bool_)
-    if len(dele):
-        grid_mark_deleted(gk, gid, grid_keys(dele), dele, keep)
-    gk2 = gk[keep]; gid2 = gid[keep]
-    if len(ins):
-        ki = grid_keys(ins); o = np.argsort(ki, kind='stable'); ki = ki[o]; ins = ins[o]
-        pos = np.searchsorted(gk2, ki, side='right')
-        gk2 = np.insert(gk2, pos, ki); gid2 = np.insert(gid2, pos, ins)
-    return gk2, gid2
-
-GRID_UPD = os.environ.get('V26_GRIDUPD', '1') == '1'
-
-def grid_register(*pairs):
-    GRIDS.clear()
-    for a, g in pairs:
-        if a is not None and g is not None:
-            GRIDS.append((a, g[0], g[1]))
-
-def grid_for(active):
-    if not GRID_ON or active is None:
-        return None
-    for a, gk, gid in GRIDS:
-        if a is active:
-            return gk, gid
-    for a, gk, gid in list(GRIDS):
-        if a.shape == active.shape and np.array_equal(a, active):
-            GRIDS.append((active, gk, gid))          # same snapshot, another array object: remember it
-            return gk, gid
-    return None
-
-@numba.njit(parallel=True)
-def grid_query(nd, PP, FF, gk, gid, dd, d2, NB, OFF, allowed_f, use_allowed, samef, cnt, ptr, out, fill):
-    """pass 1 (fill=False): cnt[i] = number of grid instances within dd of nd[i] (different feature unless samef);
-    pass 2 (fill=True): write them to out[ptr[i]:ptr[i+1]]."""
-    for i in prange(len(nd)):
-        o = nd[i]; fo = FF[o]
-        cx = np.int64(np.floor(PP[o, 0] / dd)) + OFF; cy = np.int64(np.floor(PP[o, 1] / dd)) + OFF; cz = np.int64(np.floor(PP[o, 2] / dd)) + OFF
-        c = 0; q = ptr[i] if fill else 0
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                for dz in range(-1, 2):
-                    key = ((cx + dx) * NB + (cy + dy)) * NB + (cz + dz)
-                    lo = np.searchsorted(gk, key); hi = np.searchsorted(gk, key, side='right')
-                    for j in range(lo, hi):
-                        v = gid[j]
-                        if not samef and FF[v] == fo:
-                            continue
-                        if use_allowed and not allowed_f[FF[v]]:
-                            continue
-                        ex = PP[v, 0] - PP[o, 0]; ey = PP[v, 1] - PP[o, 1]; ez = PP[v, 2] - PP[o, 2]
-                        if ex * ex + ey * ey + ez * ez <= d2:
-                            if fill:
-                                out[q] = v; q += 1
-                            c += 1
-        cnt[i] = c
-
-@numba.njit(parallel=True)
-def near_any(pr, PP, ck, cid, dd, d2, NB, OFF, out):
-    """out[i] = True iff some changed instance (cid, sorted by cell key ck) lies within dd of pr[i]."""
-    for i in prange(len(pr)):
-        o = pr[i]; hit = False
-        cx = np.int64(np.floor(PP[o, 0] / dd)) + OFF; cy = np.int64(np.floor(PP[o, 1] / dd)) + OFF; cz = np.int64(np.floor(PP[o, 2] / dd)) + OFF
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                for dz in range(-1, 2):
-                    if hit:
-                        continue
-                    key = ((cx + dx) * NB + (cy + dy)) * NB + (cz + dz)
-                    lo = np.searchsorted(ck, key); hi = np.searchsorted(ck, key, side='right')
-                    for j in range(lo, hi):
-                        v = cid[j]
-                        ex = PP[v, 0] - PP[o, 0]; ey = PP[v, 1] - PP[o, 1]; ez = PP[v, 2] - PP[o, 2]
-                        if ex * ex + ey * ey + ez * ez <= d2:
-                            hit = True
-                            break
-        out[i] = hit
-
-def probe_share(pr, chg_pts):
-    """share of the probe instances within d of a change; one sort of the changes by cell, no tree."""
-    t0 = time.time(); ck = grid_keys(chg_pts); o = np.argsort(ck, kind='stable'); out = np.zeros(len(pr), np.bool_)
-    t1 = time.time(); near_any(np.ascontiguousarray(pr, np.int64), P, ck[o], chg_pts[o], D, D * D, G_NB, G_OFF, out)
-    probe_share.t_sort = t1 - t0; probe_share.t_query = time.time() - t1     # timings, read by the cost model
-    return float(out.mean()) if len(pr) else 0.0
-
-def grid_neigh(nd, g, allowed=None, samef=False):
-    gk, gid = g; nd = np.ascontiguousarray(nd, np.int64)
-    al = np.ones(1, np.bool_) if allowed is None else np.asarray(allowed, np.bool_)
-    cnt = np.zeros(len(nd), np.int64); dummy = np.zeros(1, np.int64)
-    grid_query(nd, P, F, gk, gid, D, D * D, G_NB, G_OFF, al, allowed is not None, samef, cnt, np.zeros(len(nd) + 1, np.int64), dummy, False)
-    ptr = np.r_[0, np.cumsum(cnt)].astype(np.int64); out = np.empty(ptr[-1], np.int64)
-    grid_query(nd, P, F, gk, gid, D, D * D, G_NB, G_OFF, al, allowed is not None, samef, cnt, ptr, out, True)
-    return ptr, out
-
 def neigh(nd, active=None, allowed=None):
-    g = grid_for(active)
-    if g is not None:
-        return grid_neigh(nd, g, allowed)
     nb = TREE.query_ball_point(P[nd], D, workers=QW[0])
     lens = np.fromiter((len(x) for x in nb), np.int64, count=len(nd))
     flat = np.fromiter(itertools.chain.from_iterable(nb), np.int64, count=int(lens.sum()))
@@ -949,9 +820,6 @@ def compare(ex, est, U, kmax, var=None, taus=None, mus=(75, 90, 95), m=None, T=1
     out['deciles'] = dl
     if m is not None:
         eb = eps_b(upi, m, kmax, K, DELTA_B, T); out['bern_viol'] = int((err > eb).sum()); out['bern_ratio_max'] = float((err / eb).max())
-        lam = lam_max(U)[sel]; eb2 = eps2(upi, lam, m, kmax, K, DELTA_B, T)
-        out['bern2_viol'] = int((err > eb2).sum()); out['bern2_ratio_max'] = float((err / eb2).max())
-        out['eps2_over_eps_median'] = float(np.median(eb2 / eb)); out['lam_q'] = [float(x) for x in np.quantile(lam, [0, .25, .5, .75, 1])]
     thr = {}
     for q in mus:
         mu = float(np.quantile(upi, q / 100)); H = upi >= mu; He = e_ >= mu
@@ -962,13 +830,6 @@ def compare(ex, est, U, kmax, var=None, taus=None, mus=(75, 90, 95), m=None, T=1
             d_.update(eps_mu=em, Hhat=int(Hh.sum()), Hhat_recall=float((H & Hh).sum() / max(int(H.sum()), 1)),
                       Hhat_precision=float((H & Hh).sum() / max(int(Hh.sum()), 1)),
                       Hhat_in_band=float((Hh & (upi >= mu - 2 * em)).sum() / max(int(Hh.sum()), 1)))
-            em2 = eps2(mu, lam, m, kmax, K, DELTA_B, T); Hh2 = e_ >= mu - em2; Hp = e_ >= mu + em; Hp2 = e_ >= mu + em2
-            d_.update(eps2_mu_q=[float(x) for x in np.quantile(em2, [0, .5, 1])], eps2_mu_atH=float(np.median(em2[H])) if H.any() else None,
-                      Hhat2=int(Hh2.sum()), Hhat2_recall=float((H & Hh2).sum() / max(int(H.sum()), 1)),
-                      Hhat2_precision=float((H & Hh2).sum() / max(int(Hh2.sum()), 1)),
-                      Hplus=int(Hp.sum()), Hplus_precision=float((H & Hp).sum() / max(int(Hp.sum()), 1)), Hplus_recall=float((H & Hp).sum() / max(int(H.sum()), 1)),
-                      Hplus2=int(Hp2.sum()), Hplus2_precision=float((H & Hp2).sum() / max(int(Hp2.sum()), 1)), Hplus2_recall=float((H & Hp2).sum() / max(int(H.sum()), 1)),
-                      undecided2=int((Hh2 & ~Hp2).sum()))
         thr[str(q)] = d_
     out['thr'] = thr
     return out
@@ -980,93 +841,6 @@ def eps_b(x, m, k=3, Kf=60, delta=0.1, T=1):
     """Theorem 1 (Bernstein): |est - true| <= sqrt(2 x L / m) + 2 L / (3 m), x = true UPI (or pi_f)."""
     L = bern_L(k, Kf, delta, T)
     return np.sqrt(2.0 * np.asarray(x, dtype=np.float64) * L / m) + 2.0 * L / (3.0 * m)
-def bern_L2(k, Kf, delta=0.1, T=1):
-    """union bound over the patterns themselves (sizes 2..k), not over (feature, pattern) pairs"""
-    P_ = sum(math.comb(Kf, j) for j in range(2, k + 1))
-    return math.log(2.0 * P_ * T / delta)
-def lam_max(U):
-    """largest utility weight lambda_f(c) = U(f)/sum_{g in c} U(g) of every pattern (known exactly)"""
-    Ue = np.r_[np.asarray(U, np.float64), 0.0]
-    mx = np.maximum(np.maximum(Ue[RF[:, 0]], Ue[RF[:, 1]]), np.maximum(Ue[RF[:, 2]], Ue[RF[:, 3]]))
-    den = Ue[RF[:, 0]] + Ue[RF[:, 1]] + Ue[RF[:, 2]] + Ue[RF[:, 3]]
-    return np.where(den > 0, mx / np.maximum(den, 1e-300), 1.0)
-def eps2(x, lam, m, k=3, Kf=60, delta=0.1, T=1):
-    """pattern-level Bernstein bound: the UPI estimate is one sum of independent terms with range <= lam/m and
-    variance <= lam x / m, so |est - UPI| <= sqrt(2 lam x L2 / m) + 2 lam L2 / (3 m)."""
-    L2 = bern_L2(k, Kf, delta, T); lam = np.asarray(lam, np.float64)
-    return np.sqrt(2.0 * lam * np.asarray(x, dtype=np.float64) * L2 / m) + 2.0 * lam * L2 / (3.0 * m)
-# ---------------------------------------------------------------- v26d: bound on the change of a UPI between snapshots
-# With persistent seeds, UPI_t(c) - UPI_{t-1}(c) is estimated by a sum over instances of D_o = y_o^t - y_o^{t-1},
-# y_o^s = 1[o sampled at s] 1[c in P_s(o)] w_o^s / U_c^s. The D_o are independent (one seed each), |D_o - E D_o| <= b,
-# and Var(sum) <= V = E sum Dl_o^2, where Dl_o drops the deterministic terms of heavy instances (u >= tau, always sampled),
-# so |Dl_o| <= b' = max lambda / m. V is bounded from the sample: sum D_o^2 has nonnegative terms <= b'^2, so
-# V <= (b' sqrt(L1/2) + sqrt(b'^2 L1/2 + Vhat))^2 (one-sided, Maurer). Then |dhat - d| <= sqrt(2 V L2) + 2 b L2 / 3.
-# Union bound over the P patterns and the T-1 updates: L1 = ln(2 P (T-1)/delta), L2 = ln(4 P (T-1)/delta).
-@numba.njit
-def sort_rows_local(ptr, r):
-    for o in range(len(ptr) - 1):
-        a = ptr[o]; b = ptr[o + 1]
-        if b - a > 1:
-            r[a:b] = np.sort(r[a:b])
-
-@numba.njit
-def cross_acc(ia, ib, wa, wb, pa, ra, pb, rb, X):
-    """X[r] += wa[j] * wb[j] for every pattern r in both P_a(ia[j]) and P_b(ib[j]) (rows sorted)."""
-    for j in range(len(ia)):
-        i = ia[j]; k = ib[j]; x = pa[i]; xe = pa[i + 1]; y = pb[k]; ye = pb[k + 1]; w = wa[j] * wb[j]
-        while x < xe and y < ye:
-            if ra[x] == rb[y]:
-                X[ra[x]] += w; x += 1; y += 1
-            elif ra[x] < rb[y]:
-                x += 1
-            else:
-                y += 1
-
-def sample_emit(act, u, m, kmax):
-    """threshold sample (persistent seeds) with the participation set of every sampled instance."""
-    ua = np.where(act, u, 0.0); Uf = np.bincount(F, weights=ua, minlength=K); tau = np.where(Uf > 0, Uf / m, 0.0)
-    sel = np.nonzero(act & (ua > tau[F] * R))[0]; w = np.maximum(ua[sel], tau[F[sel]])
-    _, _, _, cnt, (lptr, lr) = run_enum(sel, np.zeros(len(sel)), kmax, active=act, emit=True)
-    sort_rows_local(lptr, lr)
-    wl = np.where(ua[sel] < tau[F[sel]], w, 0.0)     # light instances only: a heavy one (u >= tau) is always sampled
-    return dict(sel=sel, w=w, wl=wl, lptr=lptr, lr=lr, U=Uf, est=local_sum(w, lptr, lr), sq=local_sum(wl * wl, lptr, lr))
-
-def change_bound(a, b, m, kmax, nupd, delta=0.1):
-    """estimated change of every UPI from snapshot a to b and its bound (both from sample_emit)."""
-    Ua = dens(a['U']); Ub = dens(b['U']); ok = (Ua > 0) & (Ub > 0)
-    Ua_ = np.where(ok, Ua, 1.0); Ub_ = np.where(ok, Ub, 1.0)
-    common, ia, ib = np.intersect1d(a['sel'], b['sel'], assume_unique=True, return_indices=True)
-    X = np.zeros(NR); cross_acc(ia.astype(np.int64), ib.astype(np.int64), a['wl'][ia], b['wl'][ib], a['lptr'], a['lr'], b['lptr'], b['lr'], X)
-    vhat = np.maximum(a['sq'] / Ua_ ** 2 + b['sq'] / Ub_ ** 2 - 2.0 * X / (Ua_ * Ub_), 0.0)
-    la = lam_max(a['U']); lb = lam_max(b['U']); bb = (la + lb) / m; b1 = np.maximum(la, lb) / m
-    P_ = sum(math.comb(K, j) for j in range(2, kmax + 1)); L1 = math.log(2.0 * P_ * nupd / delta); L2 = math.log(4.0 * P_ * nupd / delta)
-    V = (b1 * math.sqrt(L1 / 2) + np.sqrt(b1 ** 2 * L1 / 2 + vhat)) ** 2
-    e = np.sqrt(2.0 * V * L2) + 2.0 * bb * L2 / 3.0
-    dhat = b['est'] / Ub_ - a['est'] / Ua_
-    return dhat, e, ok, vhat
-
-def move_eval(a, b, ex_a, ex_b, m, kmax, nupd, delta=0.1, Ua=None, Ub=None):
-    """compare certified moves (|dhat| > e) with the true changes of the UPI (exact values ex_a, ex_b)."""
-    dhat, e, ok, vhat = change_bound(a, b, m, kmax, nupd, delta)
-    sel = np.nonzero((RSIZE <= kmax) & ok & ((ex_a > 0) | (ex_b > 0)))[0]
-    da = dens(a['U'] if Ua is None else Ua)[sel]; db = dens(b['U'] if Ub is None else Ub)[sel]
-    up_a = ex_a[sel] / da; up_b = ex_b[sel] / db; d = up_b - up_a; dh = dhat[sel]; ee = e[sel]; err = np.abs(dh - d)
-    cert = np.abs(dh) > ee; right = cert & (np.sign(dh) == np.sign(d)) & (d != 0)
-    lam = np.maximum(lam_max(a['U'])[sel], lam_max(b['U'])[sel])
-    naive = eps2(up_a, lam, m, kmax, K, delta, nupd + 1) + eps2(up_b, lam, m, kmax, K, delta, nupd + 1)
-    out = dict(n=int(len(sel)), viol=int((err > ee).sum()), ratio_max=float((err / np.maximum(ee, 1e-300)).max()) if len(sel) else 0.0,
-               e_q=[float(x) for x in np.quantile(ee, [0.1, 0.5, 0.9])] if len(sel) else [], naive_q=[float(x) for x in np.quantile(naive, [0.1, 0.5, 0.9])] if len(sel) else [],
-               err_max=float(err.max()) if len(sel) else 0.0, n_cert=int(cert.sum()), n_cert_right=int(right.sum()),
-               n_cert_naive=int((np.abs(dh) > naive).sum()), n_cert_naive_right=int(((np.abs(dh) > naive) & (np.sign(dh) == np.sign(d)) & (d != 0)).sum()),
-               sum_abs_d=float(np.abs(d).sum()), sum_abs_d_cert=float(np.abs(d[right]).sum()))
-    for g in (0.005, 0.01, 0.02, 0.05):
-        big = np.abs(d) >= g
-        out[f'g{g}'] = [int(big.sum()), int((big & right).sum()), int((big & (np.abs(dh) > naive)).sum())]
-    return out
-
-MOVE_ON = os.environ.get('V26_MOVE', '1') == '1'
-MOVE_MS = [int(x) for x in os.environ.get('V26_MOVE_MS', '300,1000').split(',') if x]
-
 def eps_hoef(m, k=3, Kf=60, delta=0.1, T=1):
     return float(math.sqrt(bern_L(k, Kf, delta, T) / (2.0 * m)))
 def eps_vc(m, k=3, Kf=60, delta=0.1, c=0.5):
@@ -1202,17 +976,10 @@ def pollster_rebuild(act, u, m, kmax, Rv=None):
 
 class PMaint:
     """coordinated threshold sample with stored participation sets, maintained from deltas."""
-    def __init__(self, act, u, m, kmax, rebuild_frac=0.7, resort_frac=0.5, auto=False):
+    def __init__(self, act, u, m, kmax, rebuild_frac=0.7, resort_frac=0.5):
         self.m = m; self.kmax = kmax; self.rf = rebuild_frac; self.sf = resort_frac
         self.act = act.copy(); self.u = np.where(act, u, 0.0).astype(np.float64)
-        self.stale = False; self.est_rb = None; self.rng = np.random.default_rng(5)
-        tb = time.time(); self.full(); ns = max(int(self.ins.sum()), 1); self.t_full = time.time() - tb
-        self.ce = self.t_star_full / ns; self.cr = 0.6 * self.ce; self.cq = 0.05 * self.ce
-        # v26d: calibration factors, measured time / modelled time, for each mode (EMA over the updates of that mode)
-        self.kd = max(1.0, (self.t_full - getattr(self, 't_idx', 0.0)) / max(self.t_star_full, 1e-9)); self.kr = 1.0; self.kn = 1.0
-        if auto:     # measure the per-star cost of a rebuild once (not counted as maintenance)
-            _, irb = pollster_rebuild(self.act, self.u, m, kmax); self.cr = irb['star_time'] / max(irb['sampled'], 1)
-            self.kr = max(1.0, irb['total_time'] / max(irb['star_time'], 1e-9))
+        self.full()
 
     # ---------------------------------------------------------------- from scratch (initial build and fallback)
     def full(self):
@@ -1222,11 +989,11 @@ class PMaint:
         self.ins = act & (u > self.tau[F] * R)
         self.heavy = self.ins & (u >= self.tau[F])
         sel = np.nonzero(self.ins)[0]
-        tb_ = time.time(); _, _, _, cnt, (lptr, lr) = run_enum(sel, np.zeros(len(sel)), self.kmax, active=act, emit=True); self.t_star_full = time.time() - tb_
+        _, _, _, cnt, (lptr, lr) = run_enum(sel, np.zeros(len(sel)), self.kmax, active=act, emit=True)
         self.Pst = {int(o): lr[lptr[i]:lptr[i + 1]].copy() for i, o in enumerate(sel)}
         self.A = np.zeros(NR); self.B = np.zeros((K, NR))
         acc_apply(np.ones(len(sel)), self.heavy[sel], u[sel], F[sel], lptr, lr, self.A, self.B)
-        tb_ = time.time(); self.build_index(); self.t_idx = time.time() - tb_
+        self.build_index()
 
     def build_index(self):
         ids = np.nonzero(self.act)[0]; f = F[ids]
@@ -1236,81 +1003,7 @@ class PMaint:
         self.dirty = np.zeros(N, bool); self.dids = np.zeros(0, np.int64); self.nd = 0; self.nact = len(ids)
 
     def estimate(self):
-        return self.est_rb if self.stale else self.A + self.B.T @ self.tau
-
-    # ---------------------------------------------------------------- v26: cost-based choice between delta and rebuild
-    def auto_step(self, ins, dele, chg, act, u, probe=2000, back=0.8):
-        """Both modes give the same sample and estimates (persistent seeds), so each update can use the cheaper one.
-        Cost model (per sampled instance): delta = c_q (find changed stars) + c_e * h (re-enumerate and store the changed
-        stars), rebuild = c_r (enumerate all sampled stars without storing them); h is the share of sampled instances within
-        d of a change, estimated from a random subset of `probe` sampled instances. Leaving rebuild mode costs one stored
-        enumeration of all stars (full()); it is taken when delta is predicted to be cheaper by the factor `back`."""
-        t0 = time.time()
-        chg_pts = np.concatenate([ins, dele]).astype(np.int64)
-        # in rebuild mode, extrapolate h from the last probe, h = 1 - (1 - h_last)^(changes / changes_last), and probe
-        # only when the extrapolation does not favour rebuilding clearly (by a factor 2)
-        skip = False
-        if self.stale and getattr(self, 'h_last', None) is not None and self.nchg_last > 0 and len(chg_pts) > 0:
-            h_ex = 1.0 - (1.0 - min(self.h_last, 0.999)) ** (len(chg_pts) / self.nchg_last)
-            n_ = max(getattr(self, 'nsel_rb', 1), 1)
-            md_ = (self.cq + self.ce * h_ex) * n_
-            skip = self.kd * md_ + self._t_ne(len(chg_pts), n_) + self.t_full / 3.0 > 2.0 * back * self.kr * self.cr * n_
-        if skip:
-            h = h_ex
-        else:
-            held = self.held_ids(); n_ = max(len(held), 1)
-            if len(chg_pts) and len(held):
-                pr = held if len(held) <= probe else self.rng.choice(held, probe, replace=False)
-                h = probe_share(pr, chg_pts)
-                # locating the changed stars: one pass over the changes plus one test per held instance (measured on the probe)
-                self.ts_per = probe_share.t_sort / len(chg_pts); self.tq_per = probe_share.t_query / len(pr)
-            else:
-                h = 0.0
-            self.h_last = h; self.nchg_last = len(chg_pts)
-        t_probe = time.time() - t0
-        md = (self.cq + self.ce * h) * n_; mr = self.cr * n_
-        t_ne = self._t_ne(len(chg_pts), n_)
-        pred_d = self.kd * md + t_ne; pred_r = self.kr * mr
-        # leaving rebuild mode costs one full stored build (measured), amortized over 3 updates
-        go_delta = (pred_d + self.t_full / 3.0 < back * pred_r) if self.stale else (pred_d < pred_r)
-        if go_delta and self.stale:
-            tb = time.time(); self.act = act.copy(); self.u = np.where(act, u, 0.0).astype(np.float64); self.stale = False; self.full()
-            ns = max(int(self.ins.sum()), 1); self.ce = 0.5 * self.ce + 0.5 * self.t_star_full / ns; self.t_full = time.time() - tb
-            info = dict(mode='full', star_time=time.time() - tb)
-        elif go_delta:
-            tb = time.time(); info = self.step(ins, dele, chg, act, u); t_act = time.time() - tb
-            if info.get('mode') == 'delta':
-                if info['recomputed'] > 50:
-                    self.ce = 0.5 * self.ce + 0.5 * info['star_time'] / info['recomputed']
-                self.cq = 0.5 * self.cq + 0.5 * info['near_time'] / n_
-                t_nr = info.get('near_time', 0.0)
-                if t_ne > 0:
-                    self.kn = 0.5 * self.kn + 0.5 * self.kn * t_nr / t_ne
-                self.kd = max(0.5, 0.5 * self.kd + 0.5 * (t_act - t_nr) / max(md, 1e-9))
-        else:
-            tb = time.time(); est, irb = pollster_rebuild(act, u, self.m, self.kmax); t_act = time.time() - tb
-            self.cr = 0.5 * self.cr + 0.5 * irb['star_time'] / max(irb['sampled'], 1)
-            self.kr = 0.5 * self.kr + 0.5 * t_act / max(self.cr * n_, 1e-9)
-            self.stale = True; self.est_rb = est; self.act = act; self.u = u     # references only: copied when leaving rebuild mode
-            self.nsel_rb = irb['sampled']; info = dict(mode='rebuild', star_time=irb['star_time'])
-        info.update(probe_skip=bool(skip), probe_h=h, probe_time=t_probe, pred_delta=pred_d, pred_rebuild=pred_r, total_time=time.time() - t0,
-                    c_e=self.ce, c_r=self.cr, c_q=self.cq)
-        return info
-
-    def _t_ne(self, nchg, n_):
-        """predicted time to locate the changed stars, calibrated (kn) on the measured near_time of incremental updates."""
-        if nchg == 0:
-            return 0.0
-        return getattr(self, 'kn', 1.0) * (getattr(self, 'ts_per', 0.0) * nchg + getattr(self, 'tq_per', 0.0) * n_)
-
-    def held_ids(self):
-        if self.stale:
-            return self._rb_sel()
-        return np.fromiter(self.Pst.keys(), np.int64, count=len(self.Pst))
-
-    def _rb_sel(self):
-        ua = np.where(self.act, self.u, 0.0); Uf = np.bincount(F, weights=ua, minlength=K); tau = np.where(Uf > 0, Uf / self.m, 0.0)
-        return np.nonzero(self.act & (ua > tau[F] * R))[0]
+        return self.A + self.B.T @ self.tau
 
     def state_entries(self):
         return int(sum(len(x) for x in self.Pst.values()))
@@ -1446,13 +1139,6 @@ def neighbours_of(nodes):
     if len(nodes) == 0:
         return np.zeros(0, np.int64)
     parts = [nodes.astype(np.int64)]
-    if GRID_ON and GRIDS:
-        seen_ = set()
-        for a, gk, gid in GRIDS:
-            if id(gk) in seen_:
-                continue
-            seen_.add(id(gk)); parts.append(grid_neigh(nodes, (gk, gid), samef=True)[1])
-        return np.unique(np.concatenate(parts))
     for a in range(0, len(nodes), 50000):
         nb = TREE.query_ball_point(P[nodes[a:a + 50000]], D, workers=QW[0])
         lens = np.fromiter((len(x) for x in nb), np.int64, count=len(nb))
@@ -1636,17 +1322,13 @@ if 'util' in PARTS:
         gptr, gr, t_store = build_store(nodes_all, 3, act_all); log('util store', len(gr), t_store)
         REPS = int(os.environ.get('V17_REPS', '10')); idx_by_f = [np.nonzero(F == f)[0] for f in range(K)]
         sel3 = RSIZE <= 3
-        UMETH = os.environ.get('V26_UMETH', 'pps,threshold,priority,uniform,uniform_sn').split(',')
-        UKEEP = os.environ.get('V26_UTILS', 'log,raw,uniform,lognormal,pareto').split(',')
         for uname, uu in UTILS.items():
-            if uname not in UKEEP:
-                continue
             U = np.bincount(F, weights=uu, minlength=K)
             exf = [csr_sum(idx_by_f[f], uu[idx_by_f[f]], gptr, gr) for f in range(K)]
             ex = np.sum(exf, axis=0)
             row = dict(utility=uname, res={})
             for m in MS:
-                for meth in UMETH:
+                for meth in ('pps', 'threshold', 'priority', 'uniform', 'uniform_sn'):
                     reps = []
                     for r_ in range(REPS):
                         rr = np.random.default_rng(1000 * r_ + m); Rv = rr.random(N) + 1e-12
@@ -1677,17 +1359,13 @@ if 'util' in PARTS:
                         e = compare(ex, est, U, 3, mus=(90,), m=m)
                         reps.append(dict(mae=e['mae'], max=e['max'], f1=e['thr']['90']['f1'], pi_max=pimax, fviol=fviol, fratio=fratio,
                                          upi_viol=e['bern_viol'], upi_ratio=e['bern_ratio_max'], hhat_recall=e['thr']['90']['Hhat_recall'],
-                                         size=nsamp, hhat_precision=e['thr']['90']['Hhat_precision'], upi2_viol=e['bern2_viol'], upi2_ratio=e['bern2_ratio_max'],
-                                         hhat2_precision=e['thr']['90']['Hhat2_precision'], hhat2_recall=e['thr']['90']['Hhat2_recall'],
-                                         hplus_precision=e['thr']['90']['Hplus_precision'], hplus_recall=e['thr']['90']['Hplus_recall'],
-                                         hplus2_precision=e['thr']['90']['Hplus2_precision'], hplus2_recall=e['thr']['90']['Hplus2_recall'],
-                                         e2e=e['eps2_over_eps_median'], eps_mu=e['thr']['90']['eps_mu'], eps2_mu_med=e['thr']['90']['eps2_mu_q'][1]))
+                                         size=nsamp))
                     agg = {k_: float(np.mean([x[k_] for x in reps])) for k_ in reps[0]}
                     agg.update(max_over_reps=float(max(x['max'] for x in reps)), pi_max_over_reps=float(max(x['pi_max'] for x in reps)),
                                eps_bound=eps_vc(m, 3, K), bound_violations=int(sum(x['pi_max'] > eps_vc(m, 3, K) for x in reps)),
                                eps_hoef=eps_hoef(m, 3, K), hoef_violations=int(sum(x['pi_max'] > eps_hoef(m, 3, K) for x in reps)),
                                bern_reps_viol=int(sum(x['fviol'] > 0 for x in reps)), bern_fratio_max=float(max(x['fratio'] for x in reps)),
-                               bern_upi_reps_viol=int(sum(x['upi_viol'] > 0 for x in reps)), bern2_upi_reps_viol=int(sum(x['upi2_viol'] > 0 for x in reps)))
+                               bern_upi_reps_viol=int(sum(x['upi_viol'] > 0 for x in reps)))
                     row['res'][f'{meth}_{m}'] = agg; log('util', uname, meth, m, json.dumps(agg))
             S['v19']['util'].append(row); save()
         del gptr, gr
@@ -1806,16 +1484,13 @@ def eucoloc_insert(ins, act, u, prev_u, prev_act, gptr, gr, ex, kmax):
     gptr, gr = eu_merge(gptr, gr, pv, pr, np.bincount(pv, minlength=N).astype(np.int64))
     return gptr, gr, time.time() - t0, int(len(pv))
 
-STREAM_AUTO = os.environ.get('V26_SAUTO', '1') == '1'
-
 def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_every=1, win=0):
     S['v19'].setdefault(LABEL, [])
     try:
         cum = np.cumsum(CM_, axis=1); first = np.where(CM_.sum(1) > 0, np.argmax(CM_ > 0, axis=1), NMON_)
         lastseen = np.full(N, -10**6); prev_act = None; prev_u = None
         gptr = np.zeros(N + 1, np.int64); gr = np.zeros(0, np.int32); ex_inc = np.zeros(NR)
-        eu = None; pol = {m: None for m in DYN_M}; pola = {m: None for m in DYN_M}; prev_status = {}; mu = None; ages = {m: {} for m in DYN_M}
-        mv_prev = {}; ref_prev = None
+        eu = None; pol = {m: None for m in DYN_M}; prev_status = {}; mu = None; ages = {m: {} for m in DYN_M}
         for t in range(NMON_):
             lastseen = np.where(CM_[:, t] > 0, t, lastseen)
             act = (first <= t) if insert_only else ((first <= t) & (t - lastseen < IDLE_))
@@ -1878,15 +1553,8 @@ def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_ev
             row['pollster'] = {}
             chg_d = np.nonzero(act & prev_act & (u != prev_u))[0] if prev_act is not None else None   # delta input (not timed)
             for m in DYN_M:
-                for mode in (('coord', 'auto', 'indep') if STREAM_AUTO else ('coord', 'indep')):
-                    if mode == 'auto':
-                        if pola[m] is None:
-                            tb = time.time(); pola[m] = PMaint(act, u, m, kmax, auto=True); info = dict(mode='init', total_time=time.time() - tb)
-                        else:
-                            info = pola[m].auto_step(ins, dele, chg_d, act, u)
-                            est_rb, _ = pollster_rebuild(act, u, m, kmax); info['maint_vs_rebuild_maxdiff'] = maxdiff(est_rb, pola[m].estimate())
-                        est = pola[m].estimate()
-                    elif mode == 'coord':
+                for mode in ('coord', 'indep'):
+                    if mode == 'coord':
                         if pol[m] is None:
                             tb = time.time(); pol[m] = PMaint(act, u, m, kmax); info = dict(mode='init', total_time=time.time() - tb)
                         else:
@@ -1899,8 +1567,6 @@ def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_ev
                     info.update(mae=c_['mae'], max=c_['max'], f1=c_['thr']['90']['f1'], bern_viol=c_['bern_viol'],
                                 bern_ratio_max=c_['bern_ratio_max'], hhat_recall=c_['thr']['90']['Hhat_recall'],
                                 hhat_precision=c_['thr']['90']['Hhat_precision'], mu=c_['thr']['90']['mu'], eps_mu=c_['thr']['90'].get('eps_mu'))
-                    info.update(bern2_viol=c_['bern2_viol'], bern2_ratio_max=c_['bern2_ratio_max'],
-                                **{k_: c_['thr']['90'][k_] for k_ in ('Hhat2', 'Hhat2_precision', 'Hhat2_recall', 'H', 'Hplus2', 'Hplus2_precision', 'Hplus2_recall')})
                     if mode == 'coord' and prev_act is not None:
                         est_rb, irb = pollster_rebuild(act, u, m, kmax)
                         info['rebuild_time'] = irb['total_time']; info['maint_vs_rebuild_maxdiff'] = maxdiff(est_rb, est)
@@ -1925,15 +1591,6 @@ def run_stream(CM_, NMON_, IDLE_, LABEL, insert_only, eucoloc, kmax=3, remine_ev
                                                          n_reported=int((okm & (Es != pEv)).sum()), n_both=int((okm & ~same & (Es != pEv)).sum()))
                     prev_status[key] = (sel, Hs, Es); info['mis_rate'] = float((Es != Hs).mean())
                     row['pollster'][key] = info
-            if MOVE_ON:
-                for m_ in MOVE_MS:
-                    tb_ = time.time(); cur_ = sample_emit(act, u, m_, kmax); t_s = time.time() - tb_
-                    if m_ in mv_prev:
-                        tb_ = time.time(); mv_ = move_eval(mv_prev[m_], cur_, ref_prev, ref, m_, kmax, NMON_ - 1)
-                        mv_.update(emit_time=t_s, eval_time=time.time() - tb_); row.setdefault('moves', {})[str(m_)] = mv_
-                        log(LABEL + ' moves m=%d' % m_, json.dumps(mv_))
-                    mv_prev[m_] = cur_
-                ref_prev = ref.copy()
             S['v19'][LABEL].append(row); save()
             log(LABEL + ' t=%d' % t, json.dumps({k_: row[k_] for k_ in row if k_ != 'pollster'}),
                 json.dumps({k_: dict(t=v['total_time'], rec=v.get('recomputed'), st=v.get('state_entries'), rb=v.get('rebuild_time'), md=v.get('maint_vs_rebuild_maxdiff'), mae=v['mae'], mx=v['max'],
@@ -1949,7 +1606,6 @@ def eu_warm():
     isn = np.zeros(1, np.bool_); eu_check(z, np.zeros(1, np.int32), np.zeros(N + 1, np.int64), np.zeros(0, np.int32), isn)
     eu_merge(np.zeros(N + 1, np.int64), np.zeros(0, np.int32), np.zeros(0, np.int64), np.zeros(0, np.int32), np.zeros(N, np.int64))
     sort_rows(np.zeros(N + 1, np.int64), np.zeros(0, np.int32))
-    probe_share(np.zeros(1, np.int64), np.zeros(1, np.int64))      # compile the probe kernel outside the timings
 eu_warm()
 
 if 'mixed' in PARTS:
@@ -2238,8 +1894,7 @@ def run_stream_v22(CM_, NMON_, IDLE_, LABEL, churn_q=1.0, ms=(300, 1000), kmax=3
         dyn = np.random.default_rng(99).random(N) < churn_q; act0 = None
         lastseen = np.full(N, -10**6); prev_act = None; prev_u = None
         gptr = np.zeros(N + 1, np.int64); gr = np.zeros(0, np.int32); ex_inc = np.zeros(NR)
-        pol = {m: None for m in ms}; prev_status = {}; mu = None; ec = ExactCount(bits=27) if exact_count else None; est_rb_m = {}
-        mv_prev = {}; ref_prev = None
+        pol = {m: None for m in ms}; prev_status = {}; mu = None; ec = ExactCount(bits=27) if exact_count else None
         for t in range(NMON_):
             lastseen = np.where(CM_[:, t] > 0, t, lastseen)
             act_r = (first <= t) & (t - lastseen < IDLE_)
@@ -2250,9 +1905,6 @@ def run_stream_v22(CM_, NMON_, IDLE_, LABEL, churn_q=1.0, ms=(300, 1000), kmax=3
             U = np.bincount(F[act], weights=u[act], minlength=K)
             row = dict(snapshot=t, active=int(act.sum())); nodes = np.nonzero(act)[0]
             tb = time.time(); _tr = cKDTree(P[nodes]); row['index_rebuild_time'] = time.time() - tb; del _tr
-            if GRID_ON:
-                tb = time.time(); g_cur = grid_update(g_prev, prev_act, act) if (GRID_UPD and prev_act is not None) else grid_build(act); row['grid_time'] = time.time() - tb
-                grid_register((act, g_cur), (prev_act, g_prev if prev_act is not None else None))
             ex_rm, t_rm, _, c_rm, _ = run_enum(nodes, u[nodes], kmax, active=act)
             row.update(remine_time=t_rm, exact_state=int(c_rm.sum()))
             ti = time.time()
@@ -2303,23 +1955,15 @@ def run_stream_v22(CM_, NMON_, IDLE_, LABEL, churn_q=1.0, ms=(300, 1000), kmax=3
             row['pollster'] = {}
             for m in ms:
                 em = float(eps_b(mu, m, kmax, K, DELTA_B, NMON_))
-                for mode in ('coord', 'auto', 'indep'):
-                    if mode == 'auto':
-                        if (m, 'auto') not in pol:
-                            tb = time.time(); pol[(m, 'auto')] = PMaint(act, u, m, kmax, auto=True); info = dict(mode='init', total_time=time.time() - tb)
-                        else:
-                            info = pol[(m, 'auto')].auto_step(ins, dele, chg_d, act, u)
-                        est = pol[(m, 'auto')].estimate()
-                        if prev_act is not None:
-                            info['maint_vs_rebuild_maxdiff'] = maxdiff(est_rb_m[m], est)
-                    elif mode == 'coord':
+                for mode in ('coord', 'indep'):
+                    if mode == 'coord':
                         if pol[m] is None:
                             tb = time.time(); pol[m] = PMaint(act, u, m, kmax); info = dict(mode='init', total_time=time.time() - tb)
                         else:
                             info = pol[m].step(ins, dele, chg_d, act, u)
                         est = pol[m].estimate(); info['state_entries'] = pol[m].state_entries(); info['sampled'] = len(pol[m].Pst)
                         if prev_act is not None:
-                            est_rb, irb = pollster_rebuild(act, u, m, kmax); est_rb_m[m] = est_rb
+                            est_rb, irb = pollster_rebuild(act, u, m, kmax)
                             info['rebuild_time'] = irb['total_time']; info['maint_vs_rebuild_maxdiff'] = maxdiff(est_rb, est)
                     else:
                         Rv = np.random.default_rng(10007 * (t + 1) + m).random(N) + 1e-12
@@ -2328,63 +1972,33 @@ def run_stream_v22(CM_, NMON_, IDLE_, LABEL, churn_q=1.0, ms=(300, 1000), kmax=3
                     info.update(mae=c_['mae'], max=c_['max'], f1=c_['thr']['90']['f1'], bern_viol=c_['bern_viol'], bern_ratio_max=c_['bern_ratio_max'],
                                 hhat_precision=c_['thr']['90']['Hhat_precision'], hhat_recall=c_['thr']['90']['Hhat_recall'], eps_mu_fixed=em, mu_fixed=mu)
                     e_ = est[sel] / den; Es = e_ >= mu; key = f'{mode}_{m}'
-                    hst = {}; hlt = {}
-                    em2a = eps2(mu, lam_max(U)[sel], m, kmax, K, DELTA_B, NMON_)
-                    HOPTS = list(hfrac) + ['eps2', 'cert', 'cert2']
+                    hst = {}
                     if key in prev_status:
-                        psel, pH, pE, pHst, pHlt = prev_status[key]
+                        psel, pH, pE, pHst = prev_status[key]
                         lut = np.full(NR, -1, np.int64); lut[psel] = np.arange(len(psel)); ix = lut[sel]; okm = ix >= 0
                         pHv = np.where(okm, pH[np.maximum(ix, 0)], False); pEv = np.where(okm, pE[np.maximum(ix, 0)], False)
                         same = okm & (Hs == pHv); truec = okm & ~same
                         info['spurious_flip_rate'] = float((same & (Es != pEv)).sum() / max(okm.sum(), 1))
                         info['true_flip_rate'] = float(truec.sum() / max(okm.sum(), 1))
                         cd = {}
-                        for hf in HOPTS:
-                            h = em / 2 if hf == 'eps2' else (em if hf == 'cert' else (em2a if hf == 'cert2' else hf * mu))
-                            plt_ = np.where(okm, pHlt[str(hf)][np.maximum(ix, 0)], Hs)
-                            certn = (e_ >= mu + h) | (e_ < mu - h)
-                            if hf in ('cert', 'cert2'):
-                                # tri-state: +1 certified in, -1 certified out, 0 never certified; report only flips of a certified status
-                                prevs = np.where(okm, pHst[str(hf)][np.maximum(ix, 0)], 0).astype(np.int8)
-                                news = np.where(e_ >= mu + h, 1, np.where(e_ < mu - h, -1, 0)).astype(np.int8)
-                                cur_s = np.where(news != 0, news, prevs).astype(np.int8); hst[str(hf)] = cur_s
-                                rep_ = okm & (news != 0) & (prevs != 0) & (news != prevs)
-                                cur = cur_s > 0; prevh = prevs > 0
-                            else:
-                                prevh = np.where(okm, pHst[str(hf)][np.maximum(ix, 0)], Es)
-                                cur = np.where(e_ >= mu + h, True, np.where(e_ < mu - h, False, prevh)); hst[str(hf)] = cur
-                                rep_ = okm & (cur != prevh)
-                            hlt[str(hf)] = np.where(certn, Hs, plt_)
+                        for hf in list(hfrac) + ['eps2']:
+                            h = em / 2 if hf == 'eps2' else hf * mu
+                            prevh = np.where(okm, pHst[str(hf)][np.maximum(ix, 0)], Es)
+                            cur = np.where(e_ >= mu + h, True, np.where(e_ < mu - h, False, prevh)); hst[str(hf)] = cur
+                            rep_ = okm & (cur != prevh)
                             cd[str(hf)] = dict(n_true=int(truec.sum()), n_rep=int(rep_.sum()), n_both=int((rep_ & truec).sum()),
-                                               n_correct_lastcert=int((rep_ & (Hs != plt_)).sum()),
-                                               n_wrong_status=int((cur != Hs).sum()), n_certified=int(certn.sum()), n_patterns=int(len(sel)))
+                                               n_wrong_status=int((cur != Hs).sum()))
                         info['change_detection'] = cd
                     else:
-                        for hf in HOPTS:
-                            h = em / 2 if hf == 'eps2' else (em if hf == 'cert' else (em2a if hf == 'cert2' else hf * mu))
-                            if hf in ('cert', 'cert2'):
-                                hst[str(hf)] = np.where(e_ >= mu + h, 1, np.where(e_ < mu - h, -1, 0)).astype(np.int8)
-                            else:
-                                hst[str(hf)] = np.where(e_ >= mu + h, True, np.where(e_ < mu - h, False, Es))
-                            hlt[str(hf)] = Hs.copy()
-                    prev_status[key] = (sel, Hs, Es, hst, hlt)
+                        for hf in list(hfrac) + ['eps2']:
+                            hst[str(hf)] = Es.copy()
+                    prev_status[key] = (sel, Hs, Es, hst)
                     row['pollster'][key] = info
-            if MOVE_ON:
-                for m_ in MOVE_MS:
-                    tb_ = time.time(); cur_ = sample_emit(act, u, m_, kmax); t_s = time.time() - tb_
-                    if m_ in mv_prev:
-                        tb_ = time.time(); mv_ = move_eval(mv_prev[m_], cur_, ref_prev, ref, m_, kmax, NMON_ - 1)
-                        mv_.update(emit_time=t_s, eval_time=time.time() - tb_); row.setdefault('moves', {})[str(m_)] = mv_
-                        log(LABEL + ' moves m=%d' % m_, json.dumps(mv_))
-                    mv_prev[m_] = cur_
-                ref_prev = ref.copy()
             out.append(row); save()
             log(LABEL + ' t=%d' % t, json.dumps({k_: row[k_] for k_ in row if k_ != 'pollster'}),
                 json.dumps({k_: dict(t=v['total_time'], rb=v.get('rebuild_time'), md=v.get('maint_vs_rebuild_maxdiff'), mae=v['mae'],
                                      f1=v['f1'], sfr=v.get('spurious_flip_rate')) for k_, v in row['pollster'].items()}))
             prev_act = act; prev_u = u
-            if GRID_ON:
-                g_prev = g_cur
         del ec
     except Exception:
         import traceback; tb_ = traceback.format_exc(); log('ERROR stream v22\n' + tb_); out.append(dict(error=tb_)); save()
@@ -2676,7 +2290,6 @@ def fsq_load_release(api, tok, rel, top=None, nfiles=100):
         return np.concatenate(H), np.concatenate(LA), np.concatenate(LO), np.concatenate(FC), topd
     return np.concatenate(H), np.concatenate(LA), np.concatenate(LO), np.concatenate(FC), top
 
-AUTO_FSQ = os.environ.get('V26_AUTO', '1') == '1'
 if 'fsqdelta' in PARTS:
     S['v19']['fsqdelta'] = {}; FD = S['v19']['fsqdelta']
     try:
@@ -2733,13 +2346,10 @@ if 'fsqdelta' in PARTS:
         uU = np.exp(np.sqrt(2.0) * erfinv(2 * U01 - 1))               # same persistent utilities as the static FSQ run
         R = ((splitmix64(Hu ^ np.uint64(0x5DEECE66D)) >> np.uint64(11)).astype(np.float64) + 0.5) / 9007199254740992.0  # persistent seeds
         NAMES = lab; del Pu, Fu, U01
-        FD['steps'] = []; PMS = {}; mv_prev = {}; ref_prev = None
+        FD['steps'] = []; PMS = {}
         for t_ in range(NREL):
             act = ACT[t_]; row = dict(release=FD['releases'][t_], active=int(act.sum()))
             nodes = np.nonzero(act)[0]; U = np.bincount(F[act], weights=uU[act], minlength=K)
-            if GRID_ON:
-                tb = time.time(); g_cur = grid_update(g_prev, ACT[t_ - 1], act) if (GRID_UPD and t_ > 0) else grid_build(act); row['grid_time'] = time.time() - tb; log('fsqdelta', t_, 'grid', row['grid_time'])
-                grid_register((act, g_cur), (ACT[t_ - 1], g_prev) if t_ > 0 else (None, None))
             ex3, t3, _, c3, _ = run_enum(nodes, uU[nodes], 3, active=act); row.update(remine_k3=t3, exact_state_k3=int(c3.sum()))
             log('fsqdelta', t_, 'remine k3', t3)
             if t_ > 0:
@@ -2756,15 +2366,10 @@ if 'fsqdelta' in PARTS:
                     key = f'm{m}_k{kk}'
                     if t_ == 0:
                         tb = time.time(); PMS[key] = PMaint(act, uU, m, kk); info = dict(mode='init', total_time=time.time() - tb)
-                        if AUTO_FSQ:
-                            PMS[key + '_auto'] = PMaint(act, uU, m, kk, auto=True)
                     else:
                         info = PMS[key].step(ins, dele, chg, act, uU)
                         est_rb, irb = pollster_rebuild(act, uU, m, kk)
                         info['rebuild_time'] = irb['total_time']; info['rebuild_sample_time'] = irb['sample_time']
-                        if AUTO_FSQ:
-                            ia = PMS[key + '_auto'].auto_step(ins, dele, chg, act, uU)
-                            ia['maxdiff'] = maxdiff(est_rb, PMS[key + '_auto'].estimate()); info['auto'] = ia
                     est = PMS[key].estimate(); info['state_entries'] = PMS[key].state_entries(); info['sampled'] = len(PMS[key].Pst)
                     if t_ > 0:
                         info['maint_vs_rebuild_maxdiff'] = maxdiff(est_rb, est); del est_rb
@@ -2772,28 +2377,14 @@ if 'fsqdelta' in PARTS:
                         c_ = compare(ex3, est, U, 3, mus=(90,), m=m, T=NREL)
                         info['acc'] = dict(mae=c_['mae'], p99=c_['p99'], max=c_['max'], f1=c_['thr']['90']['f1'], mu=c_['thr']['90']['mu'],
                                            eps_mu=c_['thr']['90'].get('eps_mu'), viol=c_['bern_viol'], ratio=c_['bern_ratio_max'],
-                                           hhat_recall=c_['thr']['90']['Hhat_recall'], hhat_precision=c_['thr']['90']['Hhat_precision'],
-                                           viol2=c_['bern2_viol'], ratio2=c_['bern2_ratio_max'], e2e=c_['eps2_over_eps_median'],
-                                           **{k_: c_['thr']['90'][k_] for k_ in ('Hhat', 'Hhat2', 'Hhat2_precision', 'Hhat2_recall', 'H', 'Hplus', 'Hplus_precision',
-                                                                                 'Hplus_recall', 'Hplus2', 'Hplus2_precision', 'Hplus2_recall', 'eps2_mu_q')})
+                                           hhat_recall=c_['thr']['90']['Hhat_recall'], hhat_precision=c_['thr']['90']['Hhat_precision'])
                     if t_ == NREL - 1:
                         np.save(os.path.join(OUT, f'fsqd_est_{key}.npy'), est)
                     row[key] = info; log('fsqdelta', t_, key, json.dumps({k_: v for k_, v in info.items() if k_ != 'acc'}), json.dumps(info.get('acc')))
-            if MOVE_ON:
-                for m_ in MOVE_MS:
-                    tb_ = time.time(); cur_ = sample_emit(act, uU, m_, 3); t_s = time.time() - tb_
-                    if m_ in mv_prev:
-                        tb_ = time.time(); mv_ = move_eval(mv_prev[m_], cur_, ref_prev, ex3, m_, 3, NREL - 1)
-                        mv_.update(emit_time=t_s, eval_time=time.time() - tb_); row.setdefault('moves', {})[str(m_)] = mv_
-                        log('fsqdelta moves m=%d' % m_, json.dumps(mv_))
-                    mv_prev[m_] = cur_
-                ref_prev = ex3.copy()
             if t_ == NREL - 1:
                 np.save(os.path.join(OUT, 'fsqd_ex3_last.npy'), ex3); np.save(os.path.join(OUT, 'fsqd_U_last.npy'), U)
                 np.save(os.path.join(OUT, 'fsqd_rmask.npy'), RMASK)
             FD['steps'].append(row); save()
-            if GRID_ON:
-                g_prev = g_cur
     except Exception:
         import traceback; tb_ = traceback.format_exc(); log('ERROR fsqdelta\n' + tb_); FD['error'] = tb_; save()
 
